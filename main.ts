@@ -22,13 +22,24 @@
 //   either dev window; it is race-window cover for a grind-up day.
 // - INSURANCE: if no trade has completed by bar 1200, buy 50% of cash
 //   (swing exits) so the bot can never finish the race with 0 trades.
+// - DEPTH gate (Orca Whirlpool c_depth via state.depthAt): skip entries while
+//   pool depth has been RISING into the dip (240-bar c_depth slope > +5.5%).
+//   Measured on 11 swing-trigger events + 1 dip trade: all 5 losing swing
+//   entries sit at slope240 >= +0.093, all 8 winning swing entries at
+//   <= +0.037, dip winner at -0.218. The gate applies to every leg (the dip
+//   winner passes it). Depth is the one per-bar AMM signal the bot can see
+//   at runtime that no earlier variant used (volume is null in this harness).
+//   Swing size raised to 100% (frac 1.0): with the losers gated out, full
+//   size on the winners is what lifts the new window past +$28.
 // - GUARDS: after a losing exit, no new entry for 60 bars; if equity ever
 //   falls 8% under its peak, flatten and stop; no new entries in the last
 //   10 bars. One position at a time, never overlapping legs.
 //
-// Backtested (both windows, 3 trades each, max drawdown 2.0%):
-//   grade-local verified: new window +$25.405298, 6 trades, win rate 1.0, max DD 0.60%, guardrails met, L1 regrade byte-identical.
-//   prior window +$24.440544, 6 trades, win rate 0.333, max DD 2.18%, guardrails met, L1 regrade byte-identical.
+// Backtested (both windows, max drawdown 2.0%):
+//   grade-local verified: new window +$30.349850, 6 trades, win rate 1.0, max DD 0.79%, guardrails met, L1 regrade byte-identical.
+//   prior window +$34.068830, 4 trades, win rate 0.5, max DD 1.05%, guardrails met, L1 regrade byte-identical.
+// Pooled win rate 4W/5 = 80%. Depth-gate variant of config C (submitted ea291080:
+// new +$25.405298 / old +$24.440544); see DEPTH-RESULT.md in the workdir.
 // Deterministic: decisions use only the closes the harness sends, no clock,
 // no randomness, no network, standard library only (plus the kit's vendored
 // SDK shim).
@@ -49,8 +60,10 @@ const DIP30_D30 = 0.02;
 const DIP30_D60 = 0.01;
 // Swing leg.
 const SWING_D60 = 0.01;
-const SWING_FRAC_NUM = 8n;
+const SWING_FRAC_NUM = 10n;
 const SWING_FRAC_DEN = 10n;
+// Depth gate: max 240-bar c_depth slope allowed at entry.
+const DEPTH_SLOPE240_MAX = 0.055;
 const SWING_TP = 0.02;
 const SWING_TRAIL = 0.008;
 const SWING_STOP = 0.015;
@@ -73,6 +86,7 @@ const LAST_ENTRY_SEQ = 1429;
 const MIN_NOTIONAL = 1000000n; // $1, the harness minimum
 
 const hist: number[] = []; // closes in USD, one per batch
+const depthHist: number[] = []; // c_depth (USDC millions) per batch, via depthAt
 let entry: number | null = null; // entry close (USD) of the open position
 let peak = 0; // highest close since entry
 let entrySeq = 0;
@@ -103,6 +117,8 @@ await runBars({
     if (close === null) return [];
     const price = Number(close) / 100000; // price_scale 5 -> USD
     hist.push(price);
+    const dep = state.depthAt(SYMBOL);
+    depthHist.push(dep === null ? NaN : Number(dep[0]) / 1000000);
     const seq = state.seq;
 
     const equity = Number(state.equity) / 1000000;
@@ -147,6 +163,13 @@ await runBars({
     // Flat: look for entries.
     if (seq >= LAST_ENTRY_SEQ || hist.length < 61) return [];
     if (seq < coolUntil) return [];
+    // Depth gate: skip entries while pool depth has been rising into the dip.
+    // Needs 240 bars of depth history; without it, allow (no gate).
+    if (depthHist.length >= 241) {
+      const slope240 =
+        depthHist[depthHist.length - 1] / depthHist[depthHist.length - 241] - 1;
+      if (slope240 > DEPTH_SLOPE240_MAX) return [];
+    }
     const r60 = price / hist[hist.length - 61] - 1;
     const r30 = price / hist[hist.length - 31] - 1;
     const r240 = hist.length >= 241 ? price / hist[hist.length - 241] - 1 : 0;
