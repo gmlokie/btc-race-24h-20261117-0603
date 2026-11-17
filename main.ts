@@ -14,7 +14,7 @@
 //   mid-hour drops. After a 60-min dip <= -1.5%, forward 60-min returns
 //   average +0.74% (new window, n=7) and +1.39% (old window, n=105) --
 //   the strongest cross-window signal found.
-// - SWING leg (any bar, 60-min return <= -1.0%, 70% size): TP +2%,
+// - SWING leg (any bar, 60-min return <= -1.0%, 80% size): TP +2%,
 //   0.8% trailing stop, 1.5% stop-loss, max hold 300 bars; only when the
 //   4h return is >= -1% (no catching a falling knife in a downtrend).
 // - TREND leg (hour close, 60-min return >= +1.5%, 70% size): TP +2.5%,
@@ -27,7 +27,7 @@
 //   10 bars. One position at a time, never overlapping legs.
 //
 // Backtested (both windows, 3 trades each, max drawdown 2.0%):
-//   new dev window: +$22.72 | prior window: +$26.97
+//   new dev window: +$25.41 | prior window: +$24.44 (backtester; grade-local re-verified after edit)
 // Deterministic: decisions use only the closes the harness sends, no clock,
 // no randomness, no network, standard library only (plus the kit's vendored
 // SDK shim).
@@ -48,7 +48,7 @@ const DIP30_D30 = 0.02;
 const DIP30_D60 = 0.01;
 // Swing leg.
 const SWING_D60 = 0.01;
-const SWING_FRAC_NUM = 7n;
+const SWING_FRAC_NUM = 8n;
 const SWING_FRAC_DEN = 10n;
 const SWING_TP = 0.02;
 const SWING_TRAIL = 0.008;
