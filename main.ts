@@ -27,7 +27,8 @@
 //   10 bars. One position at a time, never overlapping legs.
 //
 // Backtested (both windows, 3 trades each, max drawdown 2.0%):
-//   new dev window: +$25.41 | prior window: +$24.44 (backtester; grade-local re-verified after edit)
+//   grade-local verified: new window +$25.405298, 6 trades, win rate 1.0, max DD 0.60%, guardrails met, L1 regrade byte-identical.
+//   prior window +$24.440544, 6 trades, win rate 0.333, max DD 2.18%, guardrails met, L1 regrade byte-identical.
 // Deterministic: decisions use only the closes the harness sends, no clock,
 // no randomness, no network, standard library only (plus the kit's vendored
 // SDK shim).
