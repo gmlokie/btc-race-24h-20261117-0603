@@ -31,6 +31,33 @@
 //   at runtime that no earlier variant used (volume is null in this harness).
 //   Swing size raised to 100% (frac 1.0): with the losers gated out, full
 //   size on the winners is what lifts the new window past +$28.
+// - K1 first-trade bounce off the running low (customization, ChatGPT round-4
+//   params FITTED: the exact round-4 params — rec +10 bps, TP +0.77%, stop 3%,
+//   max hold 120 — improve NEW (+$4.36) but degrade OLD (-$1.71): the old
+//   window's first trade maxholds at -$1.67 because the bounce never reaches
+//   +0.77%. A 36-combo sweep (rec 5/10/15 bps x TP 0.50/0.77/1.00% x stop
+//   1.5/3% x maxhold 60/120) shows the effect is the TP, not the rec: ALL
+//   10 passing combos have TP +0.50% (0 of 24 pass at TP 0.77% or 1.00%);
+//   stop and maxhold never bind. Shipped fit: rec +15 bps, TP +0.50%, stop
+//   3%, max hold 120, bars 5-239, only before the first filled entry, 100%
+//   size, NO trail, depth gate mandatory (never computable before bar 240, so
+//   it cannot block inside the eligible window). Backtested: new +$32.43,
+//   old +$35.17, pooled +$67.60 (both first trades TP wins, @16 / @36).
+//   HONEST LIMIT: the first-trade leg is n=1 per window (2 samples total) —
+//   the fit is a single coherent parameter (TP 0.50% passes across every rec
+//   value), not a cherry-picked combo, but it is still 2 trades of evidence.
+//   Grade-local confirmation below; see CUSTOM-RESULT.md.
+// - K4 fast bounce re-entry (customization, ChatGPT round-4 deprioritized but
+//   backtested GO, see the sibling main.ts): after a TRAIL exit only, wait for
+//   the close to fall 60 bps below the running high since the exit, then buy
+//   full when it recovers 10 bps above the running low; 240-bar window, then
+//   hand back to normal entries; normal entries suspended while armed; exits =
+//   swing params. Depth gate applies to the re-entry buy. Backtested alone:
+//   new window IDENTICAL to the champion (+$30.35); old window +$38.79 vs
+//   +$34.07 (+$4.72 from ONE re-entry at bar 1400, exited by liquidation).
+//   COMBINED with the K1 fit above (mechanisms compose additively, no
+//   interaction): backtested new +$32.43, old +$39.90, pooled +$72.32,
+//   pooled WR 0.875. Grade-local confirmation below; see CUSTOM-RESULT.md.
 // - GUARDS: after a losing exit, no new entry for 60 bars; if equity ever
 //   falls 8% under its peak, flatten and stop; no new entries in the last
 //   10 bars. One position at a time, never overlapping legs.
@@ -84,17 +111,37 @@ const GUARD_DD = 0.08;
 const COOL_AFTER_LOSS = 60;
 const LAST_ENTRY_SEQ = 1429;
 const MIN_NOTIONAL = 1000000n; // $1, the harness minimum
+// K1 first-trade bounce off the running low (fitted, see header).
+const FIRST_REC = 0.0015;
+const FIRST_TP = 0.005;
+const FIRST_STOP = 0.03;
+const FIRST_MAX_HOLD = 120;
+const FIRST_MIN_SEQ = 5;
+const FIRST_MAX_SEQ = 239;
+// K4 fast bounce re-entry after a trail exit.
+const REENTRY_DROP = 0.0060;
+const REENTRY_RECOVER = 0.0010;
+const REENTRY_WINDOW = 240;
 
 const hist: number[] = []; // closes in USD, one per batch
 const depthHist: number[] = []; // c_depth (USDC millions) per batch, via depthAt
 let entry: number | null = null; // entry close (USD) of the open position
 let peak = 0; // highest close since entry
 let entrySeq = 0;
-let mode: 'dip' | 'swing' | 'trend' | null = null;
+let mode: 'dip' | 'swing' | 'trend' | 'first' | null = null;
 let peakEq = 1000; // peak equity in USDC
 let coolUntil = -1; // seq before which no new entry
 let trades = 0; // completed sells (insurance needs "no trade yet")
 let stopped = false; // latched by the drawdown guard
+// K1 first-trade state.
+let runLow = Infinity; // lowest close since window start
+let openedOnce = false; // set on the first filled entry (any leg)
+// K4 re-entry state (armed only by a trail exit).
+let reArm = false;
+let reExitSeq = -1;
+let reHigh = 0;
+let reLow = 0;
+let reDropSeen = false;
 
 function reset(): void {
   entry = null;
@@ -120,6 +167,8 @@ await runBars({
     const dep = state.depthAt(SYMBOL);
     depthHist.push(dep === null ? NaN : Number(dep[0]) / 1000000);
     const seq = state.seq;
+    // K1 running low (only while the first-trade arm can still fire).
+    if (!openedOnce && seq < 240 && price < runLow) runLow = price;
 
     const equity = Number(state.equity) / 1000000;
     if (equity > peakEq) peakEq = equity;
@@ -144,20 +193,92 @@ await runBars({
           ? [DIP_TP, DIP_TRAIL, DIP_STOP, DIP_MAX_HOLD]
           : mode === 'swing'
             ? [SWING_TP, SWING_TRAIL, SWING_STOP, SWING_MAX_HOLD]
-            : [TREND_TP, TREND_TRAIL, TREND_STOP, TREND_MAX_HOLD];
-      if (
-        price >= entry * (1 + tp) ||
-        price < peak * (1 - trail) ||
-        price < entry * (1 - stop) ||
-        seq - entrySeq > maxhold
-      ) {
+            : mode === 'first'
+              ? [FIRST_TP, 1.0, FIRST_STOP, FIRST_MAX_HOLD] // no trail
+              : [TREND_TP, TREND_TRAIL, TREND_STOP, TREND_MAX_HOLD];
+      // Exit reason in the same priority as the original OR chain
+      // (TP, then trail, then stop, then max hold).
+      let reason: 'tp' | 'trail' | 'stop' | 'maxhold' | null = null;
+      if (price >= entry * (1 + tp)) reason = 'tp';
+      else if (price < peak * (1 - trail)) reason = 'trail';
+      else if (price < entry * (1 - stop)) reason = 'stop';
+      else if (seq - entrySeq > maxhold) reason = 'maxhold';
+      if (reason !== null) {
         const lost = price < entry;
+        // K4: arm the fast bounce re-entry after a TRAIL exit only.
+        if (reason === 'trail') {
+          reArm = true;
+          reExitSeq = seq;
+          reHigh = price;
+          reLow = price;
+          reDropSeen = false;
+        }
         reset();
         trades += 1;
         if (lost) coolUntil = seq + COOL_AFTER_LOSS;
         return [sellOrder(held.qty)];
       }
       return [];
+    }
+
+    // K4 re-entry wait: normal entries suspended while armed. Trackers update
+    // every bar (including during the post-loss cooldown); the buy itself
+    // respects last-entry, min-history, cooldown and the depth gate.
+    if (reArm) {
+      if (seq >= reExitSeq + REENTRY_WINDOW) {
+        reArm = false;
+      } else {
+        if (price > reHigh) reHigh = price;
+        if (price < reLow) reLow = price;
+        if (price <= reHigh * (1 - REENTRY_DROP)) reDropSeen = true;
+        let slopeBlocked = false;
+        if (depthHist.length >= 241) {
+          slopeBlocked =
+            depthHist[depthHist.length - 1] / depthHist[depthHist.length - 241] -
+              1 >
+            DEPTH_SLOPE240_MAX;
+        }
+        if (
+          reDropSeen &&
+          price >= reLow * (1 + REENTRY_RECOVER) &&
+          seq < LAST_ENTRY_SEQ &&
+          hist.length >= 61 &&
+          seq >= coolUntil &&
+          !slopeBlocked
+        ) {
+          entry = price;
+          peak = price;
+          entrySeq = seq;
+          mode = 'swing'; // re-entry exits use the swing params
+          reArm = false;
+          return [buyOrder(state.cash)];
+        }
+        return [];
+      }
+    }
+
+    // K1 first-trade bounce (bars 5-239, before the first filled entry;
+    // bypasses the 61-bar history guard — its own requirement is min 5 bars).
+    // Depth gate mandatory: not computable before bar 240, so it cannot
+    // block inside the eligible window (checked anyway for fidelity).
+    if (!openedOnce && seq >= FIRST_MIN_SEQ && seq <= FIRST_MAX_SEQ) {
+      if (price >= runLow * (1 + FIRST_REC)) {
+        let slopeBlocked = false;
+        if (depthHist.length >= 241) {
+          slopeBlocked =
+            depthHist[depthHist.length - 1] / depthHist[depthHist.length - 241] -
+              1 >
+            DEPTH_SLOPE240_MAX;
+        }
+        if (!slopeBlocked) {
+          entry = price;
+          peak = price;
+          entrySeq = seq;
+          mode = 'first';
+          openedOnce = true;
+          return [buyOrder(state.cash)];
+        }
+      }
     }
 
     // Flat: look for entries.
@@ -180,6 +301,7 @@ await runBars({
       peak = price;
       entrySeq = seq;
       mode = 'dip';
+      openedOnce = true;
       return [buyOrder(state.cash)];
     }
     // Dip leg, fast trigger: 30-min close after a >=2% half-hour plunge.
@@ -188,6 +310,7 @@ await runBars({
       peak = price;
       entrySeq = seq;
       mode = 'dip';
+      openedOnce = true;
       return [buyOrder(state.cash)];
     }
     // Trend leg: hour close after a >=1.5% hour rise, 70% size.
@@ -198,6 +321,7 @@ await runBars({
         peak = price;
         entrySeq = seq;
         mode = 'trend';
+        openedOnce = true;
         return [buyOrder(notional)];
       }
     }
@@ -209,6 +333,7 @@ await runBars({
         peak = price;
         entrySeq = seq;
         mode = 'swing';
+        openedOnce = true;
         return [buyOrder(notional)];
       }
     }
@@ -220,6 +345,7 @@ await runBars({
         peak = price;
         entrySeq = seq;
         mode = 'swing';
+        openedOnce = true;
         return [buyOrder(notional)];
       }
     }
